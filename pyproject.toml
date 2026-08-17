@@ -1,0 +1,19 @@
+[project]
+name = "pgq"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout"]
+
+[project.scripts]
+pgq = "pgq.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+timeout = 180
+markers = ["slow: takes more than 10 seconds"]
