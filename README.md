@@ -395,38 +395,3 @@ was necessary rather than decorative.
 
 MIT
 
-File Structure:
-
-pgq/
-├── README.md
-├── BUILD_AND_TEST.md
-├── pyproject.toml
-├── schema.sql
-├── docker-compose.yml
-├── .gitignore
-│
-├── src/
-│   └── pgq/
-│       ├── __init__.py        # public API — task, enqueue, Worker, reap
-│       ├── queries.py         # every SQL statement, as constants
-│       ├── registry.py        # @task decorator + name → function map
-│       ├── enqueue.py         # enqueue()
-│       ├── worker.py          # Worker, claim(), run_one()
-│       ├── reaper.py          # reap()
-│       ├── backoff.py         # backoff_seconds()
-│       └── cli.py             # pgq worker / reaper / enqueue
-│
-├── tests/
-│   ├── conftest.py
-│   ├── tasks.py               # test task definitions
-│   ├── test_concurrency.py
-│   ├── test_reclaim.py
-│   ├── test_retry.py
-│   ├── test_transactional.py
-│   ├── test_semantics.py
-│   └── test_shutdown.py
-│
-├── bench/
-│   └── bench.py
-└── examples/
-    └── with_django.py
