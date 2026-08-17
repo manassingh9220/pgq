@@ -1,10 +1,10 @@
 # pgq
 
-A job queue built on PostgreSQL. No Redis, no RabbitMQ, no broker to operate.
+A job queue built on PostgreSQL. No broker, no Redis, no extra service to operate.
 
 Jobs live in a table in the same database as your application data, which means
 **enqueueing a job and writing the data that job depends on happen in one
-transaction.** That single property is the reason this exists.
+transaction.**
 
 ```python
 with conn.transaction():
@@ -12,88 +12,95 @@ with conn.transaction():
     enqueue(conn, "send_confirmation", {"order_id": str(order.id)})
 ```
 
-If the transaction rolls back, the job was never enqueued. If it commits, the job
-is guaranteed to run. There is no window where the order exists but the email
-never sends.
+Roll back and the job never existed. Commit and it is guaranteed to run. There is
+no window where the order exists but the confirmation was never queued.
+
+That property is the reason this exists, and it is verified by
+`tests/test_transactional.py`.
 
 ---
 
 ## Why not Celery
 
-Celery is a better tool for most people. Use it unless one of these applies.
+Celery is the right tool for most people. This is worth building when one of the
+following applies.
 
-**You already run Postgres and don't want another moving part.** A broker is one
-more service to deploy, monitor, secure, back up, and page someone about at 3am.
-Below a few thousand jobs per second, Postgres handles the load fine.
+### You need transactional enqueue
 
-**You need transactional enqueue.** This is the real argument. With Celery on
-Redis, `create_order()` and `send_email.delay()` touch two different systems with
-no shared transaction. Whatever order you put them in, there is a failure window:
+With Celery on Redis, the database write and the broker publish are two separate
+systems with no shared transaction. Whatever order you put them in, there is a
+failure window:
 
 ```python
 order = create_order(data)          # commits
 send_email.delay(order.id)          # process dies here → email never sends
 ```
 
-The standard fix is the transactional outbox pattern — write the event to a table
-in the same transaction, then relay it to the broker. But if you're already
-writing jobs to a Postgres table, the relay is the only part you don't need.
-`pgq` is what the outbox pattern collapses into when you stop pretending the
-broker is necessary.
+The standard fix is the transactional outbox pattern: write the event to a table
+in the same transaction, then relay it to the broker. But if you are already
+writing jobs to a Postgres table, the relay step is the only part you do not
+need. `pgq` is what the outbox pattern collapses into when you drop the broker.
 
-**You want to inspect and manipulate the queue with SQL.** Why is this job stuck.
-What failed in the last hour. Requeue everything that hit the Mailgun outage.
-These are one-line queries here and awkward tooling problems elsewhere.
+### You already run Postgres
+
+A broker is another service to deploy, monitor, secure, back up, and get paged
+about. Below a few thousand jobs per second, Postgres handles the load.
+
+### You want to inspect the queue with SQL
+
+"Why is this job stuck." "What failed in the last hour." "Requeue everything that
+died during the outage." One-line queries here; tooling problems elsewhere.
 
 ### When to use something else
 
-| Situation                                    | Use instead          |
-| -------------------------------------------- | -------------------- |
-| Sustained throughput above ~5k jobs/sec      | Kafka, SQS, RabbitMQ |
-| Multiple services consuming the same events  | Kafka                |
-| Events must be replayable after processing   | Kafka                |
-| You need fan-out to unknown future consumers | Kafka                |
-| Your team already runs and knows Celery      | Celery               |
+| Situation | Use instead |
+|---|---|
+| Sustained throughput above a few thousand jobs/sec | Kafka, SQS, RabbitMQ |
+| Multiple services consuming the same events | Kafka |
+| Events must be replayable after processing | Kafka |
+| Your team already runs and knows Celery | Celery |
 
-`pgq` is a task queue: one job, one worker, run it once, retry on failure. It is
-not an event log.
+`pgq` is a task queue — one job, one worker, run once, retry on failure. It is not
+an event log.
 
 ---
 
 ## Quick start
 
 ```bash
-psql "$DATABASE_URL" -f schema.sql
+createdb pgq
+psql pgq -f schema.sql
+
 pip install -e .
+export DATABASE_URL="postgresql://localhost:5432/pgq"
 ```
 
-Define tasks:
+Define tasks in `tasks.py` at the project root:
 
 ```python
-# tasks.py
 from pgq import task
 
-@task("send_confirmation")
-def send_confirmation(order_id: str):
-    order = Order.objects.get(id=order_id)
-    mailer.send(order.email, "Your order", render(order))
+@task("hello")
+def hello(name):
+    print(f"hello {name}")
 ```
 
-Enqueue:
-
-```python
-from pgq import enqueue
-
-enqueue(conn, "send_confirmation", {"order_id": "abc-123"})
-enqueue(conn, "nightly_report", {}, run_at=tomorrow_at_2am)
-enqueue(conn, "resize_image", {"key": "..."}, priority=10, max_attempts=3)
-```
-
-Run workers:
+Run a worker and enqueue something:
 
 ```bash
-pgq worker --concurrency 4
-pgq reaper                    # or let a worker run it on a timer
+pgq worker                                       # terminal 1
+pgq enqueue hello '{"name": "alice"}'            # terminal 2
+```
+
+Other commands:
+
+```bash
+pgq enqueue slow '{}' --priority 10 --max-attempts 3
+pgq enqueue report '{}' --run-at '1 hour'
+pgq enqueue email '{}' --dedupe-key order-42     # idempotent
+pgq reaper                                       # reclaim orphaned jobs
+pgq reaper --once
+pgq stats
 ```
 
 ---
@@ -104,38 +111,36 @@ A job moves through four states:
 
 ```
                   reclaimed after visibility timeout
-        ┌──────────────────────────────────────────┐
-        │                                          │
-        v                                          │
-   ┌─────────┐   claim    ┌─────────┐   ok    ┌───────────┐
-   │ pending │ ─────────> │ running │ ──────> │ succeeded │
-   └─────────┘            └─────────┘         └───────────┘
-        ^                      │
-        │                      │ attempts exhausted
-        │  retry w/ backoff    v
-        └──────────────   ┌────────┐
-                          │  dead  │
-                          └────────┘
+        +------------------------------------------+
+        |                                          |
+        v                                          |
+   +---------+   claim    +---------+   ok    +-----------+
+   | pending | ---------> | running | ------> | succeeded |
+   +---------+            +---------+         +-----------+
+        ^                      |
+        |                      | attempts exhausted
+        |  retry w/ backoff    v
+        +---------------   +--------+
+                           |  dead  |
+                           +--------+
 ```
 
-Two paths lead back to `pending`: a normal failure that still has attempts left,
-and reclamation of a job whose worker disappeared without reporting anything.
+Two paths return a job to `pending`: a failure with attempts remaining, and
+reclamation of a job whose worker disappeared without reporting anything.
 
-### Claiming
+### The claim query
 
-The whole design hinges on one query:
+Everything hinges on one statement:
 
 ```sql
 UPDATE jobs
-SET status     = 'running',
-    locked_at  = now(),
-    locked_by  = %(worker)s,
-    attempts   = attempts + 1,
-    updated_at = now()
+SET status = 'running',
+    locked_by = %(worker)s,
+    locked_at = now(),
+    attempts = attempts + 1
 WHERE id = (
     SELECT id FROM jobs
-    WHERE status = 'pending'
-      AND run_at <= now()
+    WHERE status = 'pending' AND run_at <= now()
     ORDER BY priority DESC, run_at
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -143,100 +148,135 @@ WHERE id = (
 RETURNING id, task, args, attempts, max_attempts;
 ```
 
-`SKIP LOCKED` is what makes Postgres usable as a queue. Without it, a second
-worker running the same query blocks on the first worker's row lock, waits for it
-to commit, re-evaluates, discovers the row is no longer `pending`, and returns
-nothing — having spent the entire wait to accomplish nothing. Ten workers
-serialize into approximately one. `SKIP LOCKED` tells Postgres to pass over
-locked rows and take the next available one, so N workers claim N distinct jobs
-without contending.
+The subquery selects one row under a lock; the outer `UPDATE` claims it by primary
+key. `RETURNING` hands the row back, so a claim is one round trip rather than a
+select followed by an update.
 
-The subquery exists because `UPDATE` doesn't accept `ORDER BY ... LIMIT`. Select
-the id under a lock, then update by primary key.
+`UPDATE` does not accept `ORDER BY ... LIMIT`, which is why the subquery exists.
 
 ---
 
 ## Design decisions
 
-The parts that are non-obvious, and why they are the way they are.
+The parts that look wrong until you know what they prevent.
 
 ### `attempts` increments at claim time, not on failure
 
-This looks like a bug and isn't. If you increment when a job fails, a worker that
-gets `SIGKILL`ed never records its attempt. The reaper returns the job to
-`pending` with an unchanged count, and it retries forever — a poison job that
-takes down workers becomes an infinite loop.
+If you increment when a job fails, a worker killed with `SIGKILL` never records
+its attempt. The reaper returns the job to `pending` with an unchanged count and it
+retries forever — a job that crashes workers becomes an infinite loop that takes
+down the fleet.
 
 Incrementing at claim means every attempt is paid for whether or not the worker
-survives long enough to report an outcome. A job with `max_attempts = 5` runs at
-most five times no matter how it dies.
+survives to report an outcome. A job with `max_attempts = 5` runs at most five
+times however it dies.
+
+Asserted by `test_reap_returns_orphan_to_pending`, which checks `attempts == 1`
+after reclamation. That assertion is the regression guard for this decision.
 
 ### Partial indexes on status
 
 ```sql
 CREATE INDEX jobs_claim_idx ON jobs (priority DESC, run_at)
     WHERE status = 'pending';
+CREATE INDEX jobs_reclaim_idx ON jobs (locked_at)
+    WHERE status = 'running';
 ```
 
-The index contains only claimable rows. Ten million completed jobs in the table
-have zero effect on claim performance, because they aren't in the index. A full
-index on `(priority, run_at)` would grow without bound and slow every claim as
-history accumulates.
+The claim index contains only claimable rows. Ten million completed jobs have no
+effect on claim performance because they are not in the index. A full index on
+`(priority, run_at)` would grow without bound and slow every claim as history
+accumulates.
 
-### `run_at` handles both delays and retries
+Column order and direction mirror the query's `ORDER BY priority DESC, run_at`
+exactly, so Postgres walks to the first entry and stops — no sort step. The `DESC`
+is load-bearing: a backwards index scan would flip both columns, and the query
+needs mixed directions.
 
-There is no separate scheduler and no separate retry table. A delayed job is one
-with a future `run_at`. A retry is a job set back to `pending` with `run_at` moved
-forward by the backoff interval. The claim query's `run_at <= now()` filter
-handles both cases identically.
+### `run_at` handles delays and retries
 
-### Visibility timeout is per-job
+There is no scheduler table and no retry table. A delayed job has a future
+`run_at`. A retry is a job set back to `pending` with `run_at` pushed forward by
+the backoff interval. The claim query's `run_at <= now()` filter covers both.
 
-A thumbnail resize should be reclaimed after 30 seconds. A nightly report should
-not be reclaimed after 30 minutes. A single global timeout forces you to pick the
-worst case, which means genuinely dead jobs sit stuck for as long as your slowest
-task might legitimately take.
-
-### Retry backoff is jittered
+### Backoff is jittered
 
 ```python
 delay = min(2 ** attempts, 3600) * (0.5 + random.random() * 0.5)
 ```
 
-Without jitter, a downstream outage that fails 1,000 jobs at the same moment
-produces 1,000 retries at the same moment, which fail together and retry together
-— permanently synchronized, hammering the recovering service in waves. Spreading
-retries across a window is what breaks the herd.
+Without jitter, a downstream outage that fails 1,000 jobs at the same instant
+produces 1,000 retries at the same instant, which fail together and retry together
+— permanently synchronised, hitting the recovering service in waves.
 
-### Graceful shutdown flips a flag
+`test_jitter_varies` asserts twenty calls produce more than fifteen distinct
+values. Every other retry test passes without jitter, which is why this one
+exists.
 
-`SIGTERM` sets `running = False`; the current job finishes and is marked, then the
-loop exits. It does not raise or exit immediately.
+### Visibility timeout is per-job
 
-If a worker dies mid-job on every deploy, every deploy strands work for one full
-visibility timeout. With rolling deploys several times a day, that's a lot of
-mysteriously delayed jobs.
+A thumbnail resize should be reclaimed after 30 seconds. A nightly report should
+not be reclaimed after 30 minutes. A single global timeout forces the worst case,
+which means genuinely dead jobs sit stuck for as long as the slowest legitimate
+task might take.
 
-### `dedupe_key` is a unique constraint
+### `SIGTERM` sets a flag rather than raising
 
-```sql
-INSERT INTO jobs (...) VALUES (...) ON CONFLICT (dedupe_key) DO NOTHING
-```
+The current job finishes and is marked, then the loop exits. A worker that dies
+mid-job on every deploy strands work for one full visibility timeout — with
+rolling deploys several times a day, that is a lot of mysteriously delayed jobs.
 
-Idempotent enqueue with no application-level checking and no race between "does
-it exist" and "insert it". The database enforces it.
+### Unknown tasks die immediately
+
+An unregistered task name will never become registered. Retrying it five times
+with exponential backoff accomplishes nothing, so it goes straight to `dead`.
+Asserted by `test_unknown_task_dies_without_retry`.
+
+---
+
+## On `SKIP LOCKED`
+
+`SKIP LOCKED` is usually presented as a throughput optimisation. Measured on this
+implementation, that turned out not to be the interesting part.
+
+### The benchmark showed nothing
+
+1,000 jobs across 10 worker processes:
+
+| Claim mode | Wall time |
+|---|---|
+| `FOR UPDATE SKIP LOCKED` | 1.05s |
+| `FOR UPDATE` | 1.11s |
+
+No meaningful difference. The reason: each job is a single `INSERT` taking a few
+hundred microseconds, and the claim runs in autocommit, so the row lock is held
+for a sub-millisecond window. Ten workers rarely collide at all. `SKIP LOCKED`
+only pays off in throughput when the lock is held long enough for others to queue
+behind it.
+
+### The property that does matter is liveness
+
+`tests/test_skip_locked.py` holds a lock on the head row from a separate
+transaction and asserts a worker still processes the remaining 9 of 10 jobs.
+
+- With `SKIP LOCKED`: 9 jobs complete, the locked row stays `pending`.
+- With plain `FOR UPDATE`: the worker blocks on its first claim and processes
+  zero. It never reaches any other job.
+
+That is what production failure looks like — one hung transaction, one stalled
+connection, one long-running query — and it is the case worth protecting against.
+`SKIP LOCKED` is a liveness guarantee here, not a speed one.
 
 ---
 
 ## Delivery guarantees
 
-**At-least-once.** A job can run more than once. This is not a bug to be fixed;
-it's inherent. If a worker completes a job and then dies before the `UPDATE`
-marking it succeeded, there is no way for anyone else to know the work happened.
-The reaper will run it again.
+**At-least-once.** A job can run more than once. If a worker completes a job and
+dies before the `UPDATE` marking it succeeded, nobody can know the work happened,
+and the reaper will run it again.
 
-Exactly-once delivery is not achievable across two systems. Exactly-once
-_effects_ are, and they're your responsibility:
+This is not fixable. Exactly-once delivery across two systems is not achievable.
+Exactly-once *effects* are, and they are the task's responsibility:
 
 ```python
 @task("charge_card")
@@ -244,9 +284,13 @@ def charge_card(order_id: str, idempotency_key: str):
     stripe.PaymentIntent.create(..., idempotency_key=idempotency_key)
 ```
 
-Make tasks idempotent. Use natural keys, upserts, or the downstream API's
-idempotency support. Assume every task will run twice, because eventually one
-will.
+Write tasks assuming they will run twice, because eventually one will. Use
+upserts, natural keys, or the downstream API's idempotency support.
+
+`dedupe_key` covers the producer side — the same key twice yields one job, via a
+unique constraint and `ON CONFLICT DO NOTHING`. Note that SQL treats `NULL` as
+distinct from `NULL`, so jobs without a key never collide
+(`test_null_dedupe_keys_dont_collide`).
 
 ---
 
@@ -258,140 +302,122 @@ will.
 UPDATE jobs
 SET status = CASE WHEN attempts >= max_attempts THEN 'dead'::job_status
                   ELSE 'pending'::job_status END,
-    locked_at = NULL, locked_by = NULL,
-    last_error = 'reclaimed: worker vanished',
-    updated_at = now()
+    locked_by = NULL, locked_at = NULL,
+    last_error = 'reclaimed: worker vanished'
 WHERE status = 'running'
   AND locked_at < now() - visibility_timeout;
 ```
 
-Run every 30 seconds. Idempotent and cheap — `jobs_reclaim_idx` keeps it fast.
+Run every 30 seconds. Idempotent and cheap thanks to `jobs_reclaim_idx`.
 
-### Heartbeats for long jobs
-
-A task that legitimately runs longer than its visibility timeout will be reclaimed
-and run again concurrently with itself. Extend the lease from a background thread:
-
-```python
-UPDATE jobs SET locked_at = now() WHERE id = %s AND locked_by = %s
-```
-
-The `locked_by` guard stops a zombie worker from re-extending a lease that has
-already been reclaimed and handed to someone else.
-
-### Housekeeping
-
-```sql
-DELETE FROM jobs
-WHERE status = 'succeeded' AND completed_at < now() - interval '7 days';
-```
-
-Keep `dead` rows longer — they're the debugging record. At high volume, partition
-by `created_at` and drop partitions instead of deleting rows.
+`test_reap_ignores_live_workers` guards the other direction — a reaper that is too
+aggressive steals jobs from workers still running them, which is worse than having
+no reaper at all.
 
 ### Useful queries
 
 ```sql
--- current backlog by task
+-- backlog by task
 SELECT task, count(*) FROM jobs WHERE status='pending' GROUP BY task;
 
--- oldest unclaimed job (your real latency metric)
+-- the metric that actually matters: how far behind are the workers
 SELECT now() - min(run_at) FROM jobs WHERE status='pending' AND run_at <= now();
 
--- what's failing
+-- what is failing
 SELECT task, count(*), max(last_error) FROM jobs
-WHERE status='dead' AND completed_at > now() - interval '1 hour'
+WHERE status='dead' AND created_at > now() - interval '1 hour'
 GROUP BY task;
 
 -- requeue everything that died during an outage
 UPDATE jobs SET status='pending', attempts=0, run_at=now()
 WHERE status='dead' AND task='send_email'
-  AND completed_at BETWEEN '2026-08-10 09:00' AND '2026-08-10 11:00';
+  AND created_at BETWEEN '2026-08-10 09:00' AND '2026-08-10 11:00';
 ```
 
-That last one is the argument for SQL-native queues in one line.
+That last one is the argument for a SQL-native queue in one statement.
 
----
-
-## Reducing latency
-
-Polling adds up to `poll_interval` of latency. `LISTEN`/`NOTIFY` removes it:
+### Housekeeping
 
 ```sql
-CREATE FUNCTION notify_new_job() RETURNS trigger AS $$
-BEGIN
-    PERFORM pg_notify('jobs', '');
-    RETURN NEW;
-END $$ LANGUAGE plpgsql;
-
-CREATE TRIGGER jobs_notify AFTER INSERT ON jobs
-FOR EACH ROW EXECUTE FUNCTION notify_new_job();
+DELETE FROM jobs
+WHERE status = 'succeeded' AND created_at < now() - interval '7 days';
 ```
 
-**Keep polling as a fallback.** Notifications fire on commit and are lost if
-nobody is listening at that instant — a worker reconnecting after a network blip
-misses them silently. Poll every 5 seconds as a safety net, with `NOTIFY` as the
-fast path.
+Keep `dead` rows longer — they are the debugging record.
 
 ---
 
-## Testing
-
-The tests that matter are the concurrency and crash-recovery ones.
+## Tests
 
 ```bash
-pytest tests/ -v
+createdb pgq_test
+psql pgq_test -f schema.sql
+psql pgq_test -f tests/fixtures.sql
+
+DATABASE_URL="postgresql://localhost:5432/pgq_test" pytest tests/ -v
 ```
 
-| Test                         | What it proves                                                         |
-| ---------------------------- | ---------------------------------------------------------------------- |
-| `test_no_double_execution`   | 1,000 jobs, 10 workers, each runs exactly once                         |
-| `test_reclaim_after_crash`   | `SIGKILL` a worker; job returns to `pending`, attempts preserved       |
-| `test_backoff_schedule`      | Retry delays grow exponentially and stay within the jitter band        |
-| `test_poison_job_dies`       | A task that always fails reaches `dead` in exactly `max_attempts` runs |
-| `test_transactional_enqueue` | Rolled-back transaction leaves no job row                              |
-| `test_dedupe`                | Same `dedupe_key` twice yields one job                                 |
+23 tests. The ones that carry weight:
 
-`test_no_double_execution` is the important one. Remove `SKIP LOCKED` from the
-claim query and watch it fail — that's the demonstration that the design decision
-was necessary rather than decorative.
+| Test | What it proves |
+|---|---|
+| `test_no_double_execution` | 1,000 jobs, 10 processes, each runs exactly once |
+| `test_workers_make_progress_past_a_locked_row` | `SKIP LOCKED` liveness — 9 of 10 jobs complete past a held lock |
+| `test_rollback_leaves_no_job` | Rolled-back transaction leaves no job — the headline feature |
+| `test_commit_persists_both` | Committed transaction persists data and job together |
+| `test_reap_returns_orphan_to_pending` | Reclamation preserves `attempts` |
+| `test_reap_ignores_live_workers` | The reaper does not steal live jobs |
+| `test_poison_job_dies_after_max_attempts` | Exactly `max_attempts` runs, then `dead`, never claimed again |
+| `test_jitter_varies` | Backoff includes a random term |
+
+Correctness is asserted against a side-effect table (`results`), not against
+`status = 'succeeded'`. A bug that marked jobs done without executing them would
+pass a status check.
+
+`test_no_double_execution` uses `multiprocessing`, which on macOS spawns rather
+than forks — each child re-imports modules from scratch, so worker processes must
+import the task module themselves to populate the registry.
 
 ---
 
 ## Limitations
 
 - **Not an event log.** One job, one consumer. No fan-out, no replay.
-- **Throughput ceiling** around a few thousand jobs/sec on a single Postgres
-  primary, depending on hardware and job size. Beyond that, use a real broker.
-- **Long transactions hurt.** A slow claim holds a row lock; an open transaction
-  elsewhere blocks vacuum. Keep transactions short.
-- **No cron.** Schedule with `run_at`, or drive it from an external scheduler.
-- **No workflows.** No chains, groups, or chords. Enqueue the next job from
-  inside the previous one if you need sequencing.
+- **Throughput ceiling** in the low thousands of jobs/sec on a single primary.
+  Beyond that, use a real broker.
+- **Polling latency.** Workers poll with backoff; `LISTEN`/`NOTIFY` would cut it
+  but is not implemented. Notifications fire on commit and are lost if nobody is
+  listening, so polling would still be needed as a fallback.
+- **No heartbeat.** A task running longer than its `visibility_timeout` will be
+  reclaimed and run concurrently with itself. Set the timeout generously for slow
+  tasks.
+- **No cron.** Schedule with `run_at` or drive it externally.
+- **No workflows.** No chains or groups. Enqueue the next job from inside the
+  previous one.
 
 ---
 
-## Schema reference
+## Schema
 
-| Column               | Type          | Purpose                                           |
-| -------------------- | ------------- | ------------------------------------------------- |
-| `id`                 | `BIGSERIAL`   | Primary key                                       |
-| `task`               | `TEXT`        | Registered task name                              |
-| `args`               | `JSONB`       | Keyword arguments                                 |
-| `status`             | `job_status`  | `pending` / `running` / `succeeded` / `dead`      |
-| `priority`           | `SMALLINT`    | Higher runs first                                 |
-| `run_at`             | `TIMESTAMPTZ` | Earliest execution time; also the retry mechanism |
-| `attempts`           | `INT`         | Incremented at claim                              |
-| `max_attempts`       | `INT`         | Attempts before `dead`                            |
-| `locked_at`          | `TIMESTAMPTZ` | Lease start; drives reclamation                   |
-| `locked_by`          | `TEXT`        | `host:pid` of the claiming worker                 |
-| `visibility_timeout` | `INTERVAL`    | Per-job lease duration                            |
-| `last_error`         | `TEXT`        | Most recent traceback                             |
-| `dedupe_key`         | `TEXT UNIQUE` | Optional idempotent-enqueue key                   |
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | `BIGSERIAL` | Primary key |
+| `task` | `TEXT` | Registered task name |
+| `args` | `JSONB` | Keyword arguments |
+| `status` | `job_status` | `pending` / `running` / `succeeded` / `dead` |
+| `priority` | `SMALLINT` | Higher claims first |
+| `run_at` | `TIMESTAMPTZ` | Earliest execution time; also the retry mechanism |
+| `attempts` | `INT` | Incremented at claim |
+| `max_attempts` | `INT` | Attempts before `dead` |
+| `locked_by` | `TEXT` | `host:pid` of the claiming worker |
+| `locked_at` | `TIMESTAMPTZ` | Lease start; drives reclamation |
+| `visibility_timeout` | `INTERVAL` | Per-job lease duration |
+| `last_error` | `TEXT` | Most recent traceback |
+| `dedupe_key` | `TEXT UNIQUE` | Optional idempotent-enqueue key |
+| `created_at` | `TIMESTAMPTZ` | Insert time |
 
 ---
 
 ## License
 
 MIT
-
