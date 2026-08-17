@@ -28,9 +28,10 @@ UPDATE jobs SET status = 'dead', locked_by = NULL, last_error = %(error)s WHERE 
 """
 
 INSERT = """
-INSERT INTO jobs (task, args, run_at, priority, max_attempts) VALUES (
-%(task)s, %(args)s, COALESCE(%(run_at)s, now()),%(priority)s, %(max_attempts)s
-) RETURNING id
+INSERT INTO jobs (task, args, run_at, priority, max_attempts, dedupe_key) VALUES (
+%(task)s, %(args)s, COALESCE(%(run_at)s, now()),%(priority)s, %(max_attempts)s, %(dedupe_key)s
+) ON CONFLICT (dedupe_key) DO NOTHING
+RETURNING id
 """
 
 REAP = """

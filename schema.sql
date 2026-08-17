@@ -10,7 +10,8 @@ CREATE TABLE jobs (
     priority SMALLINT NOT NULL DEFAULT 0,
     run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_error TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    dedupe_key TEXT UNIQUE
 );
 
 CREATE INDEX jobs_claim_idx ON jobs (priority DESC, run_at)
